@@ -239,7 +239,15 @@ function generate_outbound(node) {
 
 		username: (node.type !== 'ssh') ? node.username : null,
 		user: (node.type === 'ssh') ? node.username : null,
-		password: node.password,
+		/* Snell authenticates with psk instead of password */
+		password: (node.type !== 'snell') ? node.password : null,
+		psk: (node.type === 'snell') ? node.password : null,
+		userkey: (node.type === 'snell') ? node.snell_userkey : null,
+		reuse: (node.type === 'snell') ? strToBool(node.snell_reuse) : null,
+		/* Snell v4: HTTP obfuscation; v6: traffic shaping mode */
+		obfs_mode: (node.type === 'snell') ? (node.snell_obfs_mode || null) : null,
+		obfs_host: (node.type === 'snell') ? (node.snell_obfs_host || null) : null,
+		mode: (node.type === 'snell') ? (node.snell_mode || null) : null,
 
 		/* Direct */
 		proxy_protocol: strToInt(node.proxy_protocol),
@@ -249,23 +257,26 @@ function generate_outbound(node) {
 		min_idle_session: strToInt(node.anytls_min_idle_session),
 		/* Hysteria (2) */
 		hop_interval: strToTime(node.hysteria_hop_interval),
+		hop_interval_max: strToTime(node.hysteria_hop_interval_max),
 		up_mbps: strToInt(node.hysteria_up_mbps),
 		down_mbps: strToInt(node.hysteria_down_mbps),
 		obfs: node.hysteria_obfs_type ? {
 			type: node.hysteria_obfs_type,
-			password: node.hysteria_obfs_password
+			password: node.hysteria_obfs_password,
+			min_packet_size: strToInt(node.hysteria_obfs_min_packet_size),
+			max_packet_size: strToInt(node.hysteria_obfs_max_packet_size)
 		} : node.hysteria_obfs_password,
 		auth: (node.hysteria_auth_type === 'base64') ? node.hysteria_auth_payload : null,
 		auth_str: (node.hysteria_auth_type === 'string') ? node.hysteria_auth_payload : null,
-		recv_window_conn: strToInt(node.hysteria_recv_window_conn),
-		recv_window: strToInt(node.hysteria_recv_window),
-		disable_mtu_discovery: strToBool(node.hysteria_disable_mtu_discovery),
+		/* sing-box 1.14: Hysteria2 QUIC params (Hysteria v1 recv-window tuning removed upstream) */
+		bbr_profile: (node.type === 'hysteria2') ? (node.hysteria_bbr_profile || null) : null,
+		disable_chrome_parrot: (node.type === 'hysteria2' && node.hysteria_disable_chrome_parrot === '1') ? true : null,
 		/* Shadowsocks */
 		method: node.shadowsocks_encrypt_method,
 		plugin: node.shadowsocks_plugin,
 		plugin_opts: node.shadowsocks_plugin_opts,
-		/* ShadowTLS / Socks */
-		version: (node.type === 'shadowtls') ? strToInt(node.shadowtls_version) : ((node.type === 'socks') ? node.socks_version : null),
+		/* ShadowTLS / Socks / Snell */
+		version: (node.type === 'shadowtls') ? strToInt(node.shadowtls_version) : ((node.type === 'socks') ? node.socks_version : ((node.type === 'snell') ? (strToInt(node.snell_version) || 4) : null)),
 		/* SSH */
 		client_version: node.ssh_client_version,
 		host_key: node.ssh_host_key,
@@ -307,6 +318,7 @@ function generate_outbound(node) {
 			alpn: node.tls_alpn,
 			min_version: node.tls_min_version,
 			max_version: node.tls_max_version,
+			handshake_timeout: strToTime(node.tls_handshake_timeout),
 			cipher_suites: node.tls_cipher_suites,
 			certificate_path: node.tls_cert_path,
 			ech: (node.tls_ech === '1') ? {
@@ -654,12 +666,28 @@ if (!isEmpty(main_node)) {
 
 		const legacy_filter = !isEmpty(cfg.ip_cidr) || strToBool(cfg.ip_is_private) === true;
 		if (legacy_filter && !rule.match_response && cfg.action === 'route') {
+			/* Wrap a legacy address-filter rule into the 1.14 evaluate/match_response
+			   paradigm. Carry the original query-matching fields onto the evaluate
+			   prefix rule so only queries that would have hit this rule get
+			   pre-resolved; an unconditional evaluate would resolve every query. */
 			const eval_tag = '_hp_eval_' + cfg['.name'];
-			push(builtin_dns_rules, {
+			const eval_rule = {
 				action: 'evaluate',
 				server: get_resolver(cfg.server),
 				tag: eval_tag
-			});
+			};
+			const eval_match_fields = [
+				'inbound', 'ip_version', 'query_type', 'network', 'protocol', 'auth_user',
+				'domain', 'domain_suffix', 'domain_keyword', 'domain_regex',
+				'port', 'port_range', 'source_ip_cidr', 'source_ip_is_private',
+				'source_port', 'source_port_range', 'process_name', 'process_path',
+				'process_path_regex', 'user', 'rule_set', 'rule_set_ip_cidr_match_source',
+				'invert', 'query_client_subnet', 'query_dnssec', 'source_mac_address',
+				'source_hostname'
+			];
+			for (let f in eval_match_fields)
+				eval_rule[f] = rule[f];
+			push(builtin_dns_rules, eval_rule);
 			rule.match_response = eval_tag;
 		}
 
@@ -1083,6 +1111,8 @@ if (!isEmpty(main_node)) {
 			tls_fragment: strToBool(cfg.tls_fragment),
 			tls_fragment_fallback_delay: strToTime(cfg.tls_fragment_fallback_delay),
 			tls_record_fragment: strToBool(cfg.tls_record_fragment),
+			tls_spoof: cfg.tls_spoof || null,
+			tls_spoof_method: cfg.tls_spoof_method || null,
 			source_mac_address: cfg.source_mac_address,
 			source_hostname: cfg.source_hostname
 		};
@@ -1090,7 +1120,9 @@ if (!isEmpty(main_node)) {
 			rule.server = get_resolver(cfg.resolve_server);
 			rule.strategy = cfg.resolve_strategy;
 			rule.disable_cache = strToBool(cfg.resolve_disable_cache);
+			rule.disable_optimistic_cache = strToBool(cfg.resolve_disable_optimistic_cache);
 			rule.rewrite_ttl = strToInt(cfg.resolve_rewrite_ttl);
+			rule.timeout = strToTime(cfg.resolve_timeout);
 			rule.client_subnet = cfg.resolve_client_subnet;
 		}
 		if (cfg.action === 'reject') {
@@ -1123,6 +1155,10 @@ if (!isEmpty(main_node)) {
 			rs_tag = [rs_tag];
 			for (let t in extra_tags)
 				push(rs_tag, 'cfg-' + t + '-rule');
+			/* sing-box 1.14: multi-tag requires a {tag} placeholder in the fetch source */
+			const fetch_ref = (cfg.type === 'remote') ? (cfg.url || '') : (cfg.path || '');
+			if (!match(fetch_ref, /\{tag\}/))
+				warn(sprintf("homeproxy: rule-set '%s' uses extra tags but its %s source lacks a {tag} placeholder.", cfg['.name'], cfg.type));
 		}
 
 		const ruleset = {
