@@ -75,8 +75,16 @@
 | --- | --- |
 | **route `resolve`** | 新增 `disable_optimistic_cache`、`timeout`两个控件,乐观缓存增至四个选项 |
 | **route / route-options** | 新增 `tls_spoof` / `tls_spoof_method`（注入伪造 ClientHello 干扰按 SNI 过滤的中间盒，需特权），LuCI 提供 SNI 与方式选择（默认 wrong-sequence） |
-| **规则集加载** | 多 tag 时若 `path`/`url` 缺少 `{tag}` 占位，sing-box给出警告提示，配合 LuCI 表单校验与 sing-box 的硬拒绝（`missing {tag} placeholder`），三层防护避免误配 |
+| **规则集加载** | 多 tag 时若 `path`/`url`/`initial_path` 缺少 `{tag}` 占位，生成器给出 `warn` 提示，配合 LuCI 表单校验与 sing-box 的硬拒绝（`missing {tag} placeholder`），三层防护避免误配 |
 | **i18n** | 补齐新增文案的 zh_Hans 译文 |
+
+## 工程化加固（r11）
+
+一轮以可维护性与可验证性为目标的加固：重构不改变行为，测试锁住结果，经实机验证。
+
+| 轮次 | 做了什么 | 结果 |
+| --- | --- | --- |
+| 重构和修复错误 | 重构：前端 TLS/传输表单收敛、generator 共享 TLS/transport 构建、`parse_uri` 拆为 13 个协议函数<br>测试：协议单测 153 条、generator 回归、LuCI 表单快照<br>修复：`executeCommand` 清理、dnsmasq 路径告警、fw4 清单单源、启动日志、PEM 校验、`wGET` 失败原因<br>工程：提高中文翻译率 CI、架构核实 | <br>parse_uri 对比零差异、generator JSON 逐字节一致、表单快照逐字段一致<br>顺带修复 3 个既有缺陷：证书上传、fw4 清理回滚、dnsmasq 路径 |
 
 ## 运行要求
 
@@ -84,7 +92,8 @@
 - sing-box ≥ 1.14.0（ImmortalWrt 25.12 源对应 sing-box 1.14.0-r1）
 - 低于 1.14 时服务会拒绝启动并记录明确日志
 
----
+
+
 
 <div align="center">
 

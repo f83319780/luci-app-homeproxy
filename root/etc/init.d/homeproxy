@@ -15,16 +15,33 @@ HP_DIR="/etc/homeproxy"
 RUN_DIR="/var/run/homeproxy"
 LOG_PATH="$RUN_DIR/homeproxy.log"
 
-DNSMASQ_UCI_CONFIG="$(uci -q show "dhcp.@dnsmasq[0]" | awk 'NR==1 {split($0, conf, /[.=]/); print conf[2]}')"
-if [ -f "/tmp/etc/dnsmasq.conf.$DNSMASQ_UCI_CONFIG" ]; then
-	DNSMASQ_DIR="$(awk -F '=' '/^conf-dir=/ {print $2}' "/tmp/etc/dnsmasq.conf.$DNSMASQ_UCI_CONFIG")/dnsmasq-homeproxy.d"
-else
-	DNSMASQ_DIR="/tmp/dnsmasq.d/dnsmasq-homeproxy.d"
-fi
+# fw4 chain/set inventory; single source of truth shared with firewall_post.ut
+[ -f "$HP_DIR/scripts/fw4_names.sh" ] && . "$HP_DIR/scripts/fw4_names.sh"
 
 log() {
 	echo -e "$(date "+%Y-%m-%d %H:%M:%S") [DAEMON] $*" >> "$LOG_PATH"
 }
+
+# Locate the directory dnsmasq reads the homeproxy snippets from. The UCI
+# section name of the dnsmasq config is part of /tmp/etc/dnsmasq.conf.<name>,
+# but `uci get` cannot return a section name (there is no `__name__`), so it is
+# derived from the first `uci show` line. Either step can fail on an unusual
+# setup; fall back to the generic directory and say so in the log instead of
+# silently writing dnsmasq snippets nobody reads.
+DNSMASQ_UCI_CONFIG="$(uci -q show "dhcp.@dnsmasq[0]" 2>"/dev/null" | head -n1)"
+DNSMASQ_UCI_CONFIG="${DNSMASQ_UCI_CONFIG#*.}"
+DNSMASQ_UCI_CONFIG="${DNSMASQ_UCI_CONFIG%%=*}"
+
+DNSMASQ_DIR=""
+if [ -n "$DNSMASQ_UCI_CONFIG" ] && [ -f "/tmp/etc/dnsmasq.conf.$DNSMASQ_UCI_CONFIG" ]; then
+	DNSMASQ_CONF_DIR="$(awk -F '=' '/^conf-dir=/ {print $2; exit}' "/tmp/etc/dnsmasq.conf.$DNSMASQ_UCI_CONFIG")"
+	[ -n "$DNSMASQ_CONF_DIR" ] && DNSMASQ_DIR="$DNSMASQ_CONF_DIR/dnsmasq-homeproxy.d"
+fi
+
+if [ -z "$DNSMASQ_DIR" ]; then
+	log "WARNING: unable to derive the dnsmasq conf-dir (section '${DNSMASQ_UCI_CONFIG:-unknown}'), using /tmp/dnsmasq.d/dnsmasq-homeproxy.d."
+	DNSMASQ_DIR="/tmp/dnsmasq.d/dnsmasq-homeproxy.d"
+fi
 
 restore_upnp_mappings() {
 	[ -x /etc/init.d/miniupnpd ] && /etc/init.d/miniupnpd enabled && /etc/init.d/miniupnpd running \
@@ -99,16 +116,19 @@ start_service() {
 		config_get_bool auto_update "subscription" "auto_update" "0"
 		if [ "$auto_update" = "1" ]; then
 			config_get auto_update_time "subscription" "auto_update_time" "2"
-			sed -i "/#${CONF}_autosetup/d" "/etc/crontabs/root" 2>"/dev/null"
-			echo -e "0 $auto_update_time * * * $HP_DIR/scripts/update_crond.sh #${CONF}_autosetup" >> "/etc/crontabs/root"
-			/etc/init.d/cron restart
+			sed -i "/#${CONF}_autosetup/d" "/etc/crontabs/root" 2>"/dev/null" \
+				|| log "Warning: failed to drop the previous auto-update cron entry."
+			echo -e "0 $auto_update_time * * * $HP_DIR/scripts/update_crond.sh #${CONF}_autosetup" >> "/etc/crontabs/root" \
+				|| log "Warning: failed to install the auto-update cron entry."
+			/etc/init.d/cron restart >"/dev/null" 2>&1 || log "Warning: failed to restart cron."
 		fi
 
 		local ipv6_support dns_port
 		config_get_bool ipv6_support "config" "ipv6_support" "0"
 		config_get dns_port "infra" "dns_port" "5333"
-		mkdir -p "$DNSMASQ_DIR"
-		echo -e "conf-dir=$DNSMASQ_DIR" > "$DNSMASQ_DIR/../dnsmasq-homeproxy.conf"
+		mkdir -p "$DNSMASQ_DIR" || log "Warning: failed to create ${DNSMASQ_DIR}."
+		echo -e "conf-dir=$DNSMASQ_DIR" > "$DNSMASQ_DIR/../dnsmasq-homeproxy.conf" \
+			|| log "Warning: failed to write the dnsmasq conf-dir file."
 		case "$routing_mode" in
 		"bypass_mainland_china"|"custom"|"global")
 			cat <<-EOF > "$DNSMASQ_DIR/redirect-dns.conf"
@@ -135,7 +155,8 @@ start_service() {
 			sed -r -e '/^\s*$/d' -e "s/(.*)/server=\/\1\/127.0.0.1#$dns_port\nnftset=\/\1\\/4#inet#fw4#homeproxy_wan_proxy_addr_v4$wan_nftset_v6/g" \
 				"$HP_DIR/resources/proxy_list.txt" > "$DNSMASQ_DIR/proxy_list.conf"
 		fi
-		/etc/init.d/dnsmasq restart >"/dev/null" 2>&1
+		/etc/init.d/dnsmasq restart >"/dev/null" 2>&1 \
+			|| log "Warning: failed to restart dnsmasq, DNS-based routing may be stale."
 
 		local table_mark
 		config_get table_mark "infra" "table_mark" "100"
@@ -147,12 +168,16 @@ start_service() {
 				local tproxy_mark
 				config_get tproxy_mark "infra" "tproxy_mark" "101"
 
-				ip rule add fwmark "$tproxy_mark" table "$table_mark"
-				ip route add local 0.0.0.0/0 dev lo table "$table_mark"
+				ip rule add fwmark "$tproxy_mark" table "$table_mark" 2>"/dev/null" \
+					|| log "Error: failed to add the tproxy ip rule (fwmark ${tproxy_mark}, table ${table_mark})."
+				ip route add local 0.0.0.0/0 dev lo table "$table_mark" 2>"/dev/null" \
+					|| log "Error: failed to add the tproxy local route (table ${table_mark})."
 
 				if [ "$ipv6_support" -eq "1" ]; then
-					ip -6 rule add fwmark "$tproxy_mark" table "$table_mark"
-					ip -6 route add local ::/0 dev lo table "$table_mark"
+					ip -6 rule add fwmark "$tproxy_mark" table "$table_mark" 2>"/dev/null" \
+						|| log "Error: failed to add the tproxy IPv6 rule (fwmark ${tproxy_mark}, table ${table_mark})."
+					ip -6 route add local ::/0 dev lo table "$table_mark" 2>"/dev/null" \
+						|| log "Error: failed to add the tproxy IPv6 local route (table ${table_mark})."
 				fi
 			fi
 			;;
@@ -161,16 +186,22 @@ start_service() {
 			config_get tun_name "infra" "tun_name" "singtun0"
 			config_get tun_mark "infra" "tun_mark" "102"
 
-			ip tuntap add mode tun user root name "$tun_name"
+			ip tuntap add mode tun user root name "$tun_name" 2>"/dev/null" \
+				|| log "Error: failed to create the TUN device ${tun_name}."
 			sleep 1s
-			ip link set "$tun_name" up
+			ip link set "$tun_name" up 2>"/dev/null" \
+				|| log "Error: failed to bring up the TUN device ${tun_name}."
 
-			ip route replace default dev "$tun_name" table "$table_mark"
-			ip rule add fwmark "$tun_mark" lookup "$table_mark"
+			ip route replace default dev "$tun_name" table "$table_mark" 2>"/dev/null" \
+				|| log "Error: failed to set the TUN default route (table ${table_mark})."
+			ip rule add fwmark "$tun_mark" lookup "$table_mark" 2>"/dev/null" \
+				|| log "Error: failed to add the TUN ip rule (fwmark ${tun_mark}, table ${table_mark})."
 
 			if [ "$ipv6_support" -eq "1" ]; then
-				ip -6 route replace default dev "$tun_name" table "$table_mark"
-				ip -6 rule add fwmark "$tun_mark" lookup "$table_mark"
+				ip -6 route replace default dev "$tun_name" table "$table_mark" 2>"/dev/null" \
+					|| log "Error: failed to set the TUN IPv6 default route (table ${table_mark})."
+				ip -6 rule add fwmark "$tun_mark" lookup "$table_mark" 2>"/dev/null" \
+					|| log "Error: failed to add the TUN IPv6 rule (fwmark ${tun_mark}, table ${table_mark})."
 			fi
 			;;
 		esac
@@ -253,20 +284,23 @@ start_service() {
 
 	case "$routing_mode" in
 	"bypass_mainland_china")
-		[ -e "$HP_DIR/cache.db" ] || touch "$HP_DIR/cache.db"
+		[ -e "$HP_DIR/cache.db" ] || touch "$HP_DIR/cache.db" \
+			|| log "Warning: failed to create ${HP_DIR}/cache.db."
 		;;
 	"custom")
-		[ -d "$HP_DIR/ruleset" ] || mkdir -p "$HP_DIR/ruleset"
+		[ -d "$HP_DIR/ruleset" ] || mkdir -p "$HP_DIR/ruleset" \
+			|| log "Warning: failed to create ${HP_DIR}/ruleset."
 		;;
 	esac
 
 	[ "$outbound_node" = "nil" ] || echo > "$RUN_DIR/sing-box-c.log"
 	if [ "$server_enabled" = "1" ]; then
 		echo > "$RUN_DIR/sing-box-s.log"
-		mkdir -p "$HP_DIR/certs"
+		mkdir -p "$HP_DIR/certs" || log "Warning: failed to create ${HP_DIR}/certs."
 	fi
 
-	chown sing-box:sing-box "$RUN_DIR"/sing-box-*.json "$RUN_DIR"/sing-box-*.log "$HP_DIR"/cache.db 2>"/dev/null"
+	chown sing-box:sing-box "$RUN_DIR"/sing-box-*.json "$RUN_DIR"/sing-box-*.log "$HP_DIR"/cache.db 2>"/dev/null" \
+		|| log "Warning: failed to change the ownership of the runtime files to sing-box."
 
 	ucode "$HP_DIR/scripts/firewall_pre.uc" 2>"/dev/null" || log "Error: firewall pre-script failed."
 	if [ "$outbound_node" != "nil" ]; then
@@ -279,8 +313,9 @@ start_service() {
 }
 
 stop_service() {
-	sed -i "/#${CONF}_autosetup/d" "/etc/crontabs/root" 2>"/dev/null"
-	/etc/init.d/cron restart >"/dev/null" 2>&1
+	sed -i "/#${CONF}_autosetup/d" "/etc/crontabs/root" 2>"/dev/null" \
+		|| log "Warning: failed to drop the auto-update cron entry."
+	/etc/init.d/cron restart >"/dev/null" 2>&1 || log "Warning: failed to restart cron."
 
 	config_load "$CONF"
 	local table_mark tproxy_mark tun_mark tun_name
@@ -289,69 +324,32 @@ stop_service() {
 	config_get tun_mark "infra" "tun_mark" "102"
 	config_get tun_name "infra" "tun_name" "singtun0"
 
-	ip rule del fwmark "$tproxy_mark" table "$table_mark" 2>"/dev/null"
+	# ip rule del removes a single matching rule, so a repeated start (or an
+	# upgrade that starts before the old instance stopped) leaves duplicates
+	# behind. Delete every match instead of only the first one.
+	while ip rule del fwmark "$tproxy_mark" table "$table_mark" 2>"/dev/null"; do :; done
 	ip route del local 0.0.0.0/0 dev lo table "$table_mark" 2>"/dev/null"
-	ip -6 rule del fwmark "$tproxy_mark" table "$table_mark" 2>"/dev/null"
+	while ip -6 rule del fwmark "$tproxy_mark" table "$table_mark" 2>"/dev/null"; do :; done
 	ip -6 route del local ::/0 dev lo table "$table_mark" 2>"/dev/null"
 
 	ip route del default dev "$tun_name" table "$table_mark" 2>"/dev/null"
-	ip rule del fwmark "$tun_mark" table "$table_mark" 2>"/dev/null"
+	while ip rule del fwmark "$tun_mark" table "$table_mark" 2>"/dev/null"; do :; done
 
 	ip -6 route del default dev "$tun_name" table "$table_mark" 2>"/dev/null"
-	ip -6 rule del fwmark "$tun_mark" table "$table_mark" 2>"/dev/null"
+	while ip -6 rule del fwmark "$tun_mark" table "$table_mark" 2>"/dev/null"; do :; done
 
-	nft -f - 2>"/dev/null" <<-EOF
-		flush chain inet fw4 homeproxy_dstnat_redir
-		delete chain inet fw4 homeproxy_dstnat_redir
-		flush chain inet fw4 homeproxy_output_redir
-		delete chain inet fw4 homeproxy_output_redir
-		flush chain inet fw4 homeproxy_redirect
-		delete chain inet fw4 homeproxy_redirect
-		flush chain inet fw4 homeproxy_redirect_proxy
-		delete chain inet fw4 homeproxy_redirect_proxy
-		flush chain inet fw4 homeproxy_redirect_proxy_port
-		delete chain inet fw4 homeproxy_redirect_proxy_port
-		flush chain inet fw4 homeproxy_redirect_lanac
-		delete chain inet fw4 homeproxy_redirect_lanac
-		flush chain inet fw4 homeproxy_mangle_prerouting
-		delete chain inet fw4 homeproxy_mangle_prerouting
-		flush chain inet fw4 homeproxy_mangle_output
-		delete chain inet fw4 homeproxy_mangle_output
-		flush chain inet fw4 homeproxy_mangle_tproxy
-		delete chain inet fw4 homeproxy_mangle_tproxy
-		flush chain inet fw4 homeproxy_mangle_tproxy_port
-		delete chain inet fw4 homeproxy_mangle_tproxy_port
-		flush chain inet fw4 homeproxy_mangle_tproxy_lanac
-		delete chain inet fw4 homeproxy_mangle_tproxy_lanac
-		flush chain inet fw4 homeproxy_mangle_mark
-		delete chain inet fw4 homeproxy_mangle_mark
-		flush chain inet fw4 homeproxy_mangle_tun
-		delete chain inet fw4 homeproxy_mangle_tun
-		flush chain inet fw4 homeproxy_mangle_tun_mark
-		delete chain inet fw4 homeproxy_mangle_tun_mark
-		flush set inet fw4 homeproxy_local_addr_v4
-		delete set inet fw4 homeproxy_local_addr_v4
-		flush set inet fw4 homeproxy_local_addr_v6
-		delete set inet fw4 homeproxy_local_addr_v6
-		flush set inet fw4 homeproxy_gfw_list_v4
-		delete set inet fw4 homeproxy_gfw_list_v4
-		flush set inet fw4 homeproxy_gfw_list_v6
-		delete set inet fw4 homeproxy_gfw_list_v6
-		flush set inet fw4 homeproxy_mainland_addr_v4
-		delete set inet fw4 homeproxy_mainland_addr_v4
-		flush set inet fw4 homeproxy_mainland_addr_v6
-		delete set inet fw4 homeproxy_mainland_addr_v6
-		flush set inet fw4 homeproxy_wan_proxy_addr_v4
-		delete set inet fw4 homeproxy_wan_proxy_addr_v4
-		flush set inet fw4 homeproxy_wan_proxy_addr_v6
-		delete set inet fw4 homeproxy_wan_proxy_addr_v6
-		flush set inet fw4 homeproxy_wan_direct_addr_v4
-		delete set inet fw4 homeproxy_wan_direct_addr_v4
-		flush set inet fw4 homeproxy_wan_direct_addr_v6
-		delete set inet fw4 homeproxy_wan_direct_addr_v6
-		flush set inet fw4 homeproxy_routing_port
-		delete set inet fw4 homeproxy_routing_port
-	EOF
+	# Flush and delete every fw4 object homeproxy owns. Deleting one at a
+	# time matters: `nft -f` batches are atomic, so a single object that
+	# does not exist in the current proxy mode would roll back the rest.
+	local fw4_name
+	for fw4_name in $HP_FW4_CHAINS; do
+		nft flush chain inet fw4 "$fw4_name" 2>"/dev/null"
+		nft delete chain inet fw4 "$fw4_name" 2>"/dev/null"
+	done
+	for fw4_name in $HP_FW4_SETS; do
+		nft flush set inet fw4 "$fw4_name" 2>"/dev/null"
+		nft delete set inet fw4 "$fw4_name" 2>"/dev/null"
+	done
 	: > "$RUN_DIR/fw4_forward.nft"
 	: > "$RUN_DIR/fw4_input.nft"
 	: > "$RUN_DIR/fw4_post.nft"
@@ -359,7 +357,8 @@ stop_service() {
 	restore_upnp_mappings
 
 	rm -rf "$DNSMASQ_DIR/../dnsmasq-homeproxy.conf" "$DNSMASQ_DIR"
-	/etc/init.d/dnsmasq restart >"/dev/null" 2>&1
+	/etc/init.d/dnsmasq restart >"/dev/null" 2>&1 \
+		|| log "Warning: failed to restart dnsmasq after removing the homeproxy snippets."
 
 	rm -f "$RUN_DIR/sing-box-c.json" "$RUN_DIR/sing-box-c.log" \
 		"$RUN_DIR/sing-box-s.json" "$RUN_DIR/sing-box-s.log"
